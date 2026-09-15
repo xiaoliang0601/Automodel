@@ -284,6 +284,80 @@ def make_llava_onevision_dataset(
     return [format(example) for example in dataset]
 
 
+def make_pokemon_sharegpt_dataset(
+    path_or_dataset="svjack/pokemon-blip-captions-en-zh",
+    split="train",
+    **kwargs,
+):
+    """Load a local ShareGPT-style multimodal parquet for VLM fine-tuning.
+
+    Targets datasets shaped like ``pokemon_gpt4o_zh.parquet`` with columns
+    ``conversations`` (``list<struct<from, value>>``) and ``images``
+    (``list<struct<bytes, path>>``), where human turns embed one or more
+    ``<image>`` placeholders. Images are decoded lazily in the DataLoader
+    workers via ``with_transform`` (``Image.open`` reads only the header), so
+    the dataset stays Arrow-backed rather than eagerly decoding every sample.
+
+    Args:
+        path_or_dataset: HuggingFace dataset id, local directory, or a single
+            ``.parquet`` file. A ``.parquet`` path is loaded through the
+            ``"parquet"`` builder (bare ``load_dataset(path)`` cannot read a
+            single file).
+        split: Dataset split to load (e.g. ``"train"``, ``"train[:16]"``).
+        **kwargs: Additional arguments forwarded to ``load_dataset``.
+
+    Returns:
+        An Arrow-backed dataset yielding ``{"conversation": [...]}`` dicts in the
+        standard NeMo VLM format expected by the collate functions.
+    """
+    if isinstance(path_or_dataset, str) and path_or_dataset.endswith(".parquet"):
+        dataset = load_dataset("parquet", data_files=path_or_dataset, split=split, **kwargs)
+    else:
+        dataset = load_dataset(path_or_dataset, split=split, **kwargs)
+
+    def lazy_image(value):
+        # ``images`` elements are ``{"bytes": ..., "path": ...}`` structs.
+        if isinstance(value, dict):
+            if value.get("bytes") is not None:
+                return Image.open(io.BytesIO(value["bytes"]))
+            if value.get("path"):
+                return value["path"]
+        return value
+
+    role_map = {"human": "user", "gpt": "assistant"}
+
+    def to_conversation(conversations, images):
+        decoded = [lazy_image(image) for image in (images or [])]
+        image_cursor = 0
+        nemo_conversation = []
+        for turn in conversations:
+            role = role_map.get(turn.get("from", ""), turn.get("from", ""))
+            value = turn.get("value", "") or ""
+            content_items = []
+            # Split on each ``<image>`` placeholder and interleave decoded
+            # images so their order matches the media list the collate builds.
+            parts = value.split("<image>")
+            for idx, part in enumerate(parts):
+                if idx > 0 and image_cursor < len(decoded):
+                    content_items.append({"type": "image", "image": decoded[image_cursor]})
+                    image_cursor += 1
+                text = part.strip()
+                if text:
+                    content_items.append({"type": "text", "text": text})
+            nemo_conversation.append({"role": role, "content": content_items})
+        return nemo_conversation
+
+    def transform(batch):
+        return {
+            "conversation": [
+                to_conversation(conversations, images)
+                for conversations, images in zip(batch["conversations"], batch["images"])
+            ]
+        }
+
+    return dataset.with_transform(transform)
+
+
 @dataclass
 class Tulu3MagicoderTextMixDatasetConfig:
     """Construction-time configuration for the Tulu-3/Magicoder text mixture."""

@@ -1037,6 +1037,184 @@ def kimi_k25_vl_collate_fn(
     return result
 
 
+def kimi_k3_vl_collate_fn(
+    examples: Sequence[Dict[str, Any]],
+    processor,
+    max_length: Optional[int] = None,
+    drop_overlong: bool = False,
+    ignore_index: int = -100,
+) -> Dict[str, torch.Tensor]:
+    """Collate function for the Kimi-K3 ``ForConditionalGeneration`` processor.
+
+    K3 differs from Kimi K2.5 in *where* the image placeholder is expanded.
+    ``KimiK3Processor`` emits exactly one ``<|media_pad|>`` token per image, and
+    ``KimiK3ForConditionalGeneration.forward`` expands that single placeholder to
+    ``(h // merge_h) * (w // merge_w)`` vision tokens *inside* the model
+    (``_merge_input_ids_with_image_features``), returning logits over the merged
+    sequence. Therefore this collate must **not** pre-expand ``input_ids`` the way
+    :func:`kimi_k25_vl_collate_fn` does.
+
+    The VLM recipe pops ``labels`` before ``model(**batch)`` and computes the loss
+    externally with :class:`MaskedCrossEntropy`, which applies **no** shift. So the
+    returned ``labels`` must already be (a) length-aligned to the merged
+    (post-expansion) logits and (b) shifted one position left for next-token
+    training. We build them by expanding a *local* copy of ``input_ids`` with
+    :func:`_expand_image_tokens` (identical token ordering to the model's merge)
+    and running :func:`build_labels_from_template` on that expanded copy, then
+    shifting left by one with ``ignore_index`` padding. This reproduces the loss
+    the model would have computed from its own internal ``labels`` path.
+
+    Short ``input_ids`` are right-padded to ``max_length`` so the merge observes
+    ``left_padding=False`` and the expansion layout is deterministic; the pad id is
+    the model's ``config.pad_token_id`` (via ``processor.tokenizer.pad_token_id``).
+
+    Args:
+        examples: Sequence of samples, each with an ``example["conversation"]``.
+        processor: A ``KimiK3Processor`` instance.
+        max_length: Optional fixed length to right-pad/truncate short inputs to.
+        drop_overlong: If True, drop samples exceeding ``max_length`` instead of
+            truncating them.
+        ignore_index: Label id for masked positions. Defaults to ``-100``.
+
+    Returns:
+        A dict with short ``input_ids``/``attention_mask`` (one placeholder per
+        image), merged-length shifted ``labels``, and ``pixel_values``/``grid_thws``.
+    """
+    merge_kernel = _DEFAULT_MERGE_KERNEL
+
+    conversations = [example["conversation"] for example in examples]
+
+    media_token_id = getattr(processor, "media_placeholder_token_id", None)
+    if media_token_id is None and hasattr(processor, "tokenizer"):
+        media_token_id = processor.tokenizer.convert_tokens_to_ids("<|media_pad|>")
+    if media_token_id is None:
+        media_token_id = 163605  # KimiK3Config.media_placeholder_token_id default
+
+    pad_token_id = getattr(processor.tokenizer, "pad_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = 163839  # KimiK3Config.pad_token_id default
+
+    # Per-sample short (unexpanded) inputs plus the vision payload.
+    samples: List[Dict[str, Any]] = []
+    kept_conversations: List[Sequence[Dict[str, Any]]] = []
+    all_pixel_values: List[torch.Tensor] = []
+    all_grid_thws: List[torch.Tensor] = []
+
+    for conversation in conversations:
+        medias: List[Dict[str, Any]] = []
+        for message in conversation:
+            content = message.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "image":
+                        medias.append({"type": "image", "image": item.get("image")})
+
+        text = processor.apply_chat_template(conversation, add_generation_prompt=False, tokenize=False)
+        processor_kwargs: Dict[str, Any] = {"text": text, "return_tensors": "pt"}
+        if medias:
+            processor_kwargs["medias"] = medias
+        sample_batch = processor(**processor_kwargs)
+
+        input_ids = sample_batch["input_ids"][0]
+        attention_mask = sample_batch["attention_mask"][0]
+
+        n_placeholders = int((input_ids == media_token_id).sum())
+        grid_thws = sample_batch.get("grid_thws", None)
+        has_image = grid_thws is not None and n_placeholders > 0
+
+        # Overlong handling (rare for short SFT captions).
+        if max_length is not None and input_ids.shape[0] > max_length:
+            if drop_overlong:
+                logger.warning(
+                    "Dropping overlong Kimi-K3 sample with %d tokens (max_length=%d).",
+                    input_ids.shape[0],
+                    max_length,
+                )
+                continue
+            input_ids = input_ids[:max_length]
+            attention_mask = attention_mask[:max_length]
+            # If truncation removed a placeholder, drop the orphaned image data.
+            if int((input_ids == media_token_id).sum()) != n_placeholders:
+                has_image = False
+
+        samples.append(
+            {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "grid_thws": grid_thws if has_image else None,
+            }
+        )
+        kept_conversations.append(conversation)
+        if has_image:
+            all_grid_thws.append(grid_thws)
+            if "pixel_values" in sample_batch:
+                all_pixel_values.append(sample_batch["pixel_values"])
+
+    if not samples:
+        raise ValueError(
+            f"All Kimi-K3 samples in batch exceed max_length={max_length}. Increase max_length or filter the dataset."
+        )
+
+    # Right-pad short inputs so every sequence keeps at least one trailing pad
+    # (=> the model's merge sees left_padding=False and a deterministic layout).
+    # Pad to batch_max + 1 rather than the full max_length to avoid processing a
+    # sequence that is mostly padding; the +1 guarantees the trailing pad even
+    # for the longest sample. Capped at max_length for genuinely overlong inputs.
+    batch_max = max(s["input_ids"].shape[0] for s in samples)
+    short_len = batch_max + 1 if max_length is None else min(batch_max + 1, max_length)
+
+    padded_short_ids: List[torch.Tensor] = []
+    padded_short_mask: List[torch.Tensor] = []
+    for sample in samples:
+        ids = sample["input_ids"]
+        mask = sample["attention_mask"]
+        if ids.shape[0] < short_len:
+            pad_len = short_len - ids.shape[0]
+            ids = torch.cat([ids, torch.full((pad_len,), pad_token_id, dtype=ids.dtype)])
+            mask = torch.cat([mask, torch.zeros(pad_len, dtype=mask.dtype)])
+        padded_short_ids.append(ids)
+        padded_short_mask.append(mask)
+
+    # Build a locally expanded copy solely to derive merged-length labels. The
+    # expansion mirrors the model's internal merge (same token ordering), so the
+    # labels align position-for-position with the model's merged logits.
+    expanded_ids: List[torch.Tensor] = []
+    for sample, ids, mask in zip(samples, padded_short_ids, padded_short_mask):
+        if sample["grid_thws"] is not None:
+            eids, _ = _expand_image_tokens(ids, mask, sample["grid_thws"], media_token_id, merge_kernel)
+        else:
+            eids = ids
+        expanded_ids.append(eids)
+
+    merged_len = max(e.shape[0] for e in expanded_ids)
+    padded_expanded: List[torch.Tensor] = []
+    for eids in expanded_ids:
+        if eids.shape[0] < merged_len:
+            pad_len = merged_len - eids.shape[0]
+            eids = torch.cat([eids, torch.full((pad_len,), pad_token_id, dtype=eids.dtype)])
+        padded_expanded.append(eids)
+    expanded_input_ids = torch.stack(padded_expanded)  # [B, merged_len]
+
+    labels = build_labels_from_template(expanded_input_ids, kept_conversations, processor)
+
+    # No-shift external loss => pre-shift labels one position left (next-token),
+    # keeping the merged length and padding the final column with ignore_index.
+    shifted_labels = torch.full_like(labels, ignore_index)
+    shifted_labels[:, :-1] = labels[:, 1:]
+
+    result: Dict[str, torch.Tensor] = {
+        "input_ids": torch.stack(padded_short_ids),
+        "attention_mask": torch.stack(padded_short_mask),
+        "labels": shifted_labels,
+    }
+    if all_pixel_values:
+        result["pixel_values"] = torch.cat(all_pixel_values, dim=0)
+    if all_grid_thws:
+        result["grid_thws"] = torch.cat(all_grid_thws, dim=0)
+
+    return result
+
+
 def nemotron_parse_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
@@ -2129,6 +2307,7 @@ COLLATE_FNS = {
     "Qwen3OmniMoeProcessor": qwen3_omni_collate_fn,
     "KimiVLProcessor": kimi_vl_collate_fn,
     "KimiK25Processor": kimi_k25_vl_collate_fn,
+    "KimiK3Processor": kimi_k3_vl_collate_fn,
     "NemotronParseProcessor": nemotron_parse_collate_fn,
     "NemotronH_Nano_Omni_Reasoning_V3Processor": nemotron_omni_collate_fn,
     "LlavaOneVisionProcessor": llava_onevision_collate_fn,
