@@ -649,6 +649,15 @@ class OptimizerState:
                     }
                 }
         else:
+            # Parameters that never receive a gradient (e.g. Kimi K3's layer-0
+            # self_attention_res_* params, whose first residual mix is skipped
+            # while the block residual is still empty) never get lazily-created
+            # Adam state. Without materializing it, get_optimizer_state_dict()
+            # silently omits their state at save time, yet the optimizer expects
+            # it at resume, so DCP load fails with "Missing key ...weight.step".
+            # Mirror the native path and create zero state for all params first.
+            for optimizer in self.optimizer:
+                _materialize_missing_adam_state(optimizer)
             # this line automatically manages FSDP FQN's, as well as sets the default state dict type
             # to FSDP.SHARDED_STATE_DICT
             func = partial(
