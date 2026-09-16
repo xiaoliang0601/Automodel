@@ -48,7 +48,13 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: /path/to/Kimi-K3-5L-128E-AttnRes4-MXFP4/
-  torch_dtype: bfloat16
+  # fp32 storage => the resident parameter is the fp32 master copy for torch.optim.AdamW
+  # (which keeps no internal master). With bf16 storage, Adam's ~lr-sized per-step updates
+  # (~1e-5) fall below the bf16 ULP of typical weights and get swamped to zero, which
+  # stalls early descent; fp32 captures them. This matches Relax's precision-aware
+  # optimizer (fp32 master) and is what precision_warnings.resolve_storage_dtype defaults
+  # to when torch_dtype is unset. FSDP2 still computes/all-gathers in bf16 (mp_policy).
+  torch_dtype: float32
   trust_remote_code: false
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
@@ -116,7 +122,7 @@ optimizer:
 
 lr_scheduler:
   lr_decay_style: cosine
-  lr_warmup_steps: 20
+  lr_warmup_steps: 0            # align with Relax: recipe sets no warmup (Megatron default 0)
   lr_decay_steps: 200
   max_lr: 1.0e-5
   min_lr: 1.0e-6
