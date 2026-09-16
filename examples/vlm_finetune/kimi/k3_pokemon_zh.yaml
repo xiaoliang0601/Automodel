@@ -1,0 +1,139 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Kimi-K3 VLM SFT on the pokemon-gpt4o Chinese caption set (single node, 8 GPUs).
+# Loads the real 5-layer / 128-expert MXFP4 checkpoint and runs 200 steps to
+# produce a loss curve for offline comparison against a Relax (Megatron-core)
+# reference run of the same task.
+#
+# To run this recipe:
+#   automodel examples/vlm_finetune/kimi/k3_pokemon_zh.yaml --nproc-per-node 8
+# Smoke (1 step):
+#   automodel examples/vlm_finetune/kimi/k3_pokemon_zh.yaml --nproc-per-node 8 --step_scheduler.max_steps=1
+#
+# Parallelism note: K3 does not support TP, so we use FSDP2 + EP8 (no PP/CP).
+# With 8 data-parallel streams and local_batch_size=1, the minimum global batch
+# is 8; Relax used GLOBAL_BATCH_SIZE=4, so the effective batch differs by 2x.
+
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  global_batch_size: 8        # EP8 => 8 DP streams => min GBS 8 (Relax used 4; documented diff)
+  local_batch_size: 1
+  ckpt_every_steps: 200
+  val_every_steps: null
+  max_steps: 200
+  num_epochs: 2                # 833 rows / gbs 8 ~= 104 steps/epoch; 2 epochs lets max_steps=200 cap the run
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: /path/to/Kimi-K3-5L-128E-AttnRes4-MXFP4/
+  # fp32 storage => the resident parameter is the fp32 master copy for torch.optim.AdamW
+  # (which keeps no internal master). With bf16 storage, Adam's ~lr-sized per-step updates
+  # (~1e-5) fall below the bf16 ULP of typical weights and get swamped to zero, which
+  # stalls early descent; fp32 captures them. This matches Relax's precision-aware
+  # optimizer (fp32 master) and is what precision_warnings.resolve_storage_dtype defaults
+  # to when torch_dtype is unset. FSDP2 still computes/all-gathers in bf16 (mp_policy).
+  torch_dtype: float32
+  trust_remote_code: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: eager           # eager for stability; Relax uses flash (documented diff)
+    linear: torch
+    rms_norm: torch_fp32
+    experts: torch_mm
+    dispatcher: torch
+    rope_fusion: false
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: /path/to/Kimi-K3-5L-128E-AttnRes4-MXFP4/
+  trust_remote_code: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/k3_pokemon_zh
+  model_save_format: safetensors
+  save_consolidated: false
+  dequantize_base_checkpoint: true
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 8
+  sequence_parallel: false
+  activation_checkpointing: true
+  # No `moe` block: VLM keeps the default wrap_outer_model=True so the frozen
+  # vision_tower lives inside the outer FSDP root (matches kimi25vl_medpix).
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: true
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_pokemon_sharegpt_dataset
+  path_or_dataset: /path/to/pokemon_gpt4o_zh.parquet
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 1
+  pin_memory: true
+  shuffle: true
+  collate_fn:
+    # K3-specific collate: emits 1 <|media_pad|> per image (the model expands it
+    # internally) and returns merged-length, pre-shifted labels for the recipe's
+    # no-shift MaskedCrossEntropy. See kimi_k3_vl_collate_fn for the contract.
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.kimi_k3_vl_collate_fn
+    max_length: 4096
+  drop_last: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-5
+  weight_decay: 0.1
+  betas: [0.9, 0.98]
+  eps: 1.0e-8
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 0            # align with Relax: recipe sets no warmup (Megatron default 0)
+  lr_decay_steps: 200
+  max_lr: 1.0e-5
+  min_lr: 1.0e-6
+
+clip_grad_norm:
+  max_norm: 1.0
+
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_language_model: false
+
+wandb:
+  enable: false
