@@ -1866,8 +1866,17 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         emits_hidden_states = getattr(self, "_pp_return_hidden_states", False) is True
         if self.lm_head is not None and not emits_hidden_states:
-            head_dtype = getattr(getattr(self.lm_head, "weight", None), "dtype", dtype)
-            outputs_meta = (meta(microbatch_size, seq_len, text_config.vocab_size, tensor_dtype=head_dtype),)
+            # Logits cross the PP stage boundary in the pipeline compute dtype
+            # (``dtype``, derived from the FSDP mixed-precision activation dtype),
+            # not the lm_head weight's storage dtype. Under fp32-master weights
+            # (``torch_dtype: float32``) with bf16 mixed-precision compute, the head
+            # weight is stored in fp32 but FSDP2 casts it to bf16 for the forward,
+            # so the emitted logits are bf16. lm_head is not in
+            # ``_keep_in_fp32_modules`` and ``compute_lm_head_logits`` runs with
+            # ``fp32_lm_head=False``, so the output always follows the compute dtype.
+            # Keying the meta off the weight dtype trips PipeliningShapeError
+            # ("expected float32 actual bfloat16") at the last stage.
+            outputs_meta = (meta(microbatch_size, seq_len, text_config.vocab_size),)
         elif self.model.norm is not None or block_size is None:
             outputs_meta = (meta(microbatch_size, seq_len, hidden_size),)
         else:

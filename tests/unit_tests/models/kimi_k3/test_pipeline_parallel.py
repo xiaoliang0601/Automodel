@@ -420,3 +420,23 @@ def test_pipeline_stage_metas_include_block_residual():
 
     assert [tensor.shape for tensor in inputs] == [(2, 4, 32), (8, 1, 32)]
     assert [tensor.shape for tensor in outputs] == [(2, 4, 64)]
+
+
+def test_last_stage_logits_meta_follows_pipeline_dtype_not_weight_dtype():
+    # fp32-master weights (torch_dtype: float32) with bf16 mixed-precision compute:
+    # lm_head.weight is stored in fp32 but the forward emits bf16 logits. The
+    # last-stage output meta must follow the pipeline compute dtype (bf16), not the
+    # fp32 weight storage dtype -- otherwise PP shape inference expects fp32 while
+    # the real output is bf16 and raises PipeliningShapeError at the last stage.
+    model = KimiK3ForCausalLM(_tiny_config(), backend=_torch_backend())
+    assert model.lm_head.weight.dtype == torch.float32
+
+    _, outputs = model.get_pipeline_stage_metas(
+        is_first=True,
+        microbatch_size=2,
+        seq_len=4,
+        dtype=torch.bfloat16,
+    )
+
+    assert outputs[0].shape == (2, 4, 64)
+    assert outputs[0].dtype == torch.bfloat16
