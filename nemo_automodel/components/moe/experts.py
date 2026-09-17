@@ -304,30 +304,36 @@ class GroupedExperts(nn.Module):
             f"Number of experts must be divisible by ep_size (ep_size={ep_size})"
         )
 
-        # Cast expert weights to the activation dtype so that fp32-stored
-        # parameters (e.g. under fp32 master weights) still work with kernels
-        # (grouped_gemm / torch._grouped_mm) that require matching dtypes with
-        # the (typically bf16) activations. When the weights are already in the
-        # activation dtype these casts are no-ops.
+        # Move expert weights to the activation device and dtype for the compute.
+        #   - dtype: fp32-stored parameters (e.g. under fp32 master weights) must
+        #     match the (typically bf16) activations for grouped_gemm /
+        #     torch._grouped_mm, which require matching operand dtypes.
+        #   - device: under CPUOffloadPolicy the local expert shard is offloaded
+        #     to CPU, and EP-sharded experts are never FSDP-all-gathered back to
+        #     GPU, so the weight must be streamed to the activation device here
+        #     (the expert grouped-matmul is a CUDA kernel). This transient GPU
+        #     copy is exactly the just-in-time streaming CPU offload intends.
+        # When the weights already match ``x`` these calls are no-ops.
         compute_dtype = x.dtype
+        compute_device = x.device
         gate_and_up_projs = (
             self.gate_and_up_projs.to_local() if isinstance(self.gate_and_up_projs, DTensor) else self.gate_and_up_projs
-        ).to(compute_dtype)
+        ).to(device=compute_device, dtype=compute_dtype)
         down_projs = (self.down_projs.to_local() if isinstance(self.down_projs, DTensor) else self.down_projs).to(
-            compute_dtype
+            device=compute_device, dtype=compute_dtype
         )
         gate_up_proj_bias = (
             (
                 self.gate_up_proj_bias.to_local()
                 if isinstance(self.gate_up_proj_bias, DTensor)
                 else self.gate_up_proj_bias
-            ).to(compute_dtype)
+            ).to(device=compute_device, dtype=compute_dtype)
             if self.expert_bias
             else None
         )
         down_proj_bias = (
             (self.down_proj_bias.to_local() if isinstance(self.down_proj_bias, DTensor) else self.down_proj_bias).to(
-                compute_dtype
+                device=compute_device, dtype=compute_dtype
             )
             if self.expert_bias
             else None

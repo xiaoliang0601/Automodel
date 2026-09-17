@@ -51,6 +51,18 @@ def test_get_device_gloo(monkeypatch):
     assert dev.type == "cpu"
 
 
+def test_get_device_cuda_gloo_co_backend(monkeypatch):
+    """
+    A device-typed co-backend group (CPU offload runs use "cuda:nccl,cpu:gloo")
+    must resolve to CUDA, since the NCCL backend runs the collective on cuda.
+    """
+    monkeypatch.setattr(torch.distributed, "get_backend", lambda: "cuda:nccl,cpu:gloo")
+
+    dev = sutils.get_device(local_rank=2)
+    assert dev.type == "cuda"
+    assert dev.index == 2
+
+
 def test_get_device_unknown_backend(monkeypatch):
     """
     An unsupported backend must raise RuntimeError.

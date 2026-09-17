@@ -69,6 +69,54 @@ def moe_config():
     )
 
 
+class TestGroupedExpertsOffloadDevice:
+    """GroupedExperts must stream CPU-offloaded expert weights to the activation device.
+
+    Under ``CPUOffloadPolicy`` the sharded (EP-local) expert weights live on CPU and are
+    never FSDP-all-gathered back to GPU, while activations sit on the compute device. The
+    forward must move the local weights to ``x.device`` (not merely cast dtype) before the
+    grouped matmul, otherwise ``torch._grouped_mm`` raises
+    "mat2 is on cpu, different from other tensors on cuda:N".
+    """
+
+    def test_offloaded_weights_moved_to_activation_device(self, moe_config, device):
+        # fp32-master weights kept on CPU (as CPUOffloadPolicy would); bf16 activations
+        # on the compute device -> reproduces the offload device split on a CUDA runner.
+        moe_config.dtype = torch.float32
+        backend = BackendConfig(experts="torch_mm")
+        experts = GroupedExperts(moe_config, backend=backend)  # stays on CPU
+        assert experts.use_torch_mm
+        with torch.no_grad():
+            experts.gate_and_up_projs.normal_(0, 0.02)
+            experts.down_projs.normal_(0, 0.02)
+
+        num_tokens = 8
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, moe_config.n_activated_experts, dtype=torch.bfloat16, device=device)
+        indices = torch.randint(
+            0, moe_config.n_routed_experts, (num_tokens, moe_config.n_activated_experts), device=device
+        )
+
+        # Capture the weights handed to the grouped-mm path (avoids the CUDA-only
+        # torch._grouped_mm so the assertion runs on CPU CI too).
+        captured = {}
+
+        def _capture(x_arg, token_mask_arg, weights_arg, indices_arg, gate_and_up_projs, down_projs, *rest):
+            captured["gate_and_up_projs"] = gate_and_up_projs
+            captured["down_projs"] = down_projs
+            return torch.zeros(x_arg.shape, dtype=torch.float32, device=x_arg.device)
+
+        with patch.object(experts, "_forward_grouped_mm", _capture):
+            output = experts(x, token_mask, weights, indices)
+
+        assert captured["gate_and_up_projs"].device == x.device
+        assert captured["down_projs"].device == x.device
+        assert captured["gate_and_up_projs"].dtype == x.dtype
+        assert captured["down_projs"].dtype == x.dtype
+        assert output.device == x.device
+
+
 class TestActivationFunctions:
     """Test activation functions used in MoE layers."""
 

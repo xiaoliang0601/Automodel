@@ -170,27 +170,70 @@ def _init_named_mesh(
     return device_mesh
 
 
+def _default_pg_has_cpu_backend() -> bool:
+    """Whether the default process group carries a CPU (gloo) co-backend.
+
+    A run that enables CPU parameter/optimizer offload (``CPUOffloadPolicy``)
+    initializes the default process group with a ``cuda:nccl,cpu:gloo`` backend
+    so checkpoint save/load can run DTensor collectives on CPU-resident shards.
+    Detecting that CPU backend lets the per-axis mesh subgroups mirror it. A
+    plain ``nccl`` run reports only ``cuda:nccl`` and keeps NCCL-only subgroups.
+    """
+    if not (dist.is_available() and dist.is_initialized()):
+        return False
+    try:
+        return "cpu:" in dist.get_backend_config()
+    except (RuntimeError, ValueError):
+        return False
+
+
 def _nccl_backend_override(
     axes: tuple[str, ...],
     *,
     device_type: str,
     timeout_minutes: int | None,
-):
-    """Create per-axis NCCL options for DeviceMesh subgroups.
+) -> dict[str, tuple[str, "dist.ProcessGroupNCCL.Options"]] | None:
+    """Create per-axis backend options for DeviceMesh subgroups.
 
     ``init_process_group(timeout=...)`` configures the default process group, but
     ``init_device_mesh`` creates additional per-axis process groups. Without a
     backend override those groups keep PyTorch's default NCCL timeout.
+
+    When the run enabled CPU offload -- signalled by a ``cpu:gloo`` co-backend on
+    the default process group (see :func:`_default_pg_has_cpu_backend`) -- every
+    per-axis subgroup must carry the same ``cuda:nccl,cpu:gloo`` co-backend.
+    Checkpoint save/load then runs DTensor collectives on CPU-resident shards,
+    which an NCCL-only subgroup rejects with ``No backend type associated with
+    device type cpu``. The gloo backend ignores ``ProcessGroupNCCL.Options``, so
+    the NCCL timeout is preserved for the CUDA collectives that use it.
+
+    Args:
+        axes: Mesh axis names to build backend overrides for.
+        device_type: Device type of the mesh; overrides apply only to ``"cuda"``.
+        timeout_minutes: NCCL timeout for the subgroups, or ``None`` to keep the
+            PyTorch default.
+
+    Returns:
+        A mapping from axis name to ``(backend, options)`` for
+        ``init_device_mesh``/``_flatten``/``_unflatten``, or ``None`` when no
+        override is needed (non-CUDA mesh, or CUDA mesh with neither a custom
+        timeout nor a CPU co-backend).
     """
-    if timeout_minutes is None or device_type != "cuda":
+    if device_type != "cuda":
         return None
 
-    timeout = datetime.timedelta(minutes=timeout_minutes)
+    cpu_co_backend = _default_pg_has_cpu_backend()
+    if timeout_minutes is None and not cpu_co_backend:
+        return None
+
+    backend = "cuda:nccl,cpu:gloo" if cpu_co_backend else "nccl"
+    timeout = datetime.timedelta(minutes=timeout_minutes) if timeout_minutes is not None else None
     override = {}
     for axis in axes:
         options = dist.ProcessGroupNCCL.Options()
-        options._timeout = timeout
-        override[axis] = ("nccl", options)
+        if timeout is not None:
+            options._timeout = timeout
+        override[axis] = (backend, options)
     return override
 
 
@@ -425,7 +468,12 @@ def _unflatten_compat(
 ) -> DeviceMesh:
     """Unflatten a mesh with its NCCL timeout, including the PyTorch 2.9 fallback."""
     if hasattr(flat_mesh, "_unflatten"):
-        if timeout_minutes is not None and flat_mesh.device_type == "cuda":
+        # Apply a backend override when the mesh needs a custom NCCL timeout, or
+        # when CPU offload requires the gloo co-backend on the expert subgroups.
+        needs_override = flat_mesh.device_type == "cuda" and (
+            timeout_minutes is not None or _default_pg_has_cpu_backend()
+        )
+        if needs_override:
             return flat_mesh._unflatten(
                 axis,
                 sizes,

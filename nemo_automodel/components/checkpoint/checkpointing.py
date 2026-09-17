@@ -890,10 +890,20 @@ class Checkpointer:
 
         # MoE adapters return views into model storage; DCP writes safetensors
         # data straight through them and from_hf skips the rebuild.
+        #
+        # ``dequantize_base_checkpoint`` describes the *base* HF checkpoint being
+        # MXFP4-packed, so it only applies when initializing from that base
+        # (is_init_step=True), where the adapter must build packed
+        # ``.weight_packed``/``.weight_scale`` load destinations and dequantize.
+        # Training checkpoints are always saved dequantized (save_model uses
+        # quantization=False), so a resume/restore (is_init_step=False) must read
+        # plain ``.weight`` keys; requesting packed destinations there looks for
+        # ``.weight_packed`` keys the checkpoint does not contain and fails the
+        # DCP load plan.
         state_dict = _maybe_adapt_state_dict_to_hf(
             model_state.model[0],
             state_dict,
-            quantization=self.config.dequantize_base_checkpoint,
+            quantization=bool(self.config.dequantize_base_checkpoint) and is_init_step,
             device_mesh=self.moe_mesh,
         )
 

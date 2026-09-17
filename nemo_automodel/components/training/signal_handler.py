@@ -36,18 +36,23 @@ def get_device(local_rank: Optional[int] = None) -> torch.device:
         The torch.device ('cuda' for NCCL, 'cpu' for Gloo).
 
     Raises:
-        RuntimeError: If the distributed backend is neither 'nccl' nor 'gloo'.
+        RuntimeError: If the distributed backend exposes neither 'nccl' nor 'gloo'.
     """
-    backend = torch.distributed.get_backend()
-    if backend == "nccl":
+    # ``get_backend()`` returns the plain backend name ("nccl"/"gloo") for a
+    # single-backend group, but a device-typed co-backend group (e.g. CPU offload
+    # runs initialized with "cuda:nccl,cpu:gloo") reports the combined config
+    # string. Match on substring and prefer the CUDA (NCCL) backend when present,
+    # since the caller's collective runs on the default group.
+    backend = str(torch.distributed.get_backend()).lower()
+    if "nccl" in backend:
         if local_rank is None:
             device = torch.device("cuda")
         else:
             device = torch.device(f"cuda:{local_rank}")
-    elif backend == "gloo":
+    elif "gloo" in backend:
         device = torch.device("cpu")
     else:
-        raise RuntimeError
+        raise RuntimeError(f"Unsupported distributed backend {backend!r}; expected 'nccl' or 'gloo'.")
     return device
 
 
