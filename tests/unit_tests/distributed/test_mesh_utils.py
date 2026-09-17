@@ -27,6 +27,7 @@ from nemo_automodel.components.distributed.mesh_utils import (
     _create_moe_mesh,
     _init_named_mesh,
     _MeshSpec,
+    _nccl_backend_override,
     _register_flattened_axes,
     _unflatten_compat,
     get_flat_mesh,
@@ -128,6 +129,88 @@ def test_flattened_axes_omit_nccl_timeout_when_unconfigured():
     )
 
     assert source_mesh._flatten.call_args.kwargs["backend_override"] is None
+
+
+def test_backend_override_uses_gloo_co_backend_when_offload_enabled(monkeypatch):
+    # A CPU (gloo) co-backend on the default PG signals CPU offload; the mesh
+    # subgroups must mirror it so checkpoint save/load can run CPU collectives.
+    monkeypatch.setattr(mesh_utils, "_default_pg_has_cpu_backend", lambda: True)
+
+    override = _nccl_backend_override(
+        (MeshAxisName.PP, MeshAxisName.EP),
+        device_type="cuda",
+        timeout_minutes=30,
+    )
+
+    for axis in (MeshAxisName.PP, MeshAxisName.EP):
+        backend, options = override[axis]
+        assert backend == "cuda:nccl,cpu:gloo"
+        # The NCCL timeout is preserved for the CUDA collectives.
+        assert options._timeout == datetime.timedelta(minutes=30)
+
+
+def test_backend_override_stays_nccl_only_without_offload(monkeypatch):
+    monkeypatch.setattr(mesh_utils, "_default_pg_has_cpu_backend", lambda: False)
+
+    override = _nccl_backend_override(
+        (MeshAxisName.PP,),
+        device_type="cuda",
+        timeout_minutes=30,
+    )
+
+    backend, options = override[MeshAxisName.PP]
+    assert backend == "nccl"
+    assert options._timeout == datetime.timedelta(minutes=30)
+
+
+def test_backend_override_applies_co_backend_without_timeout(monkeypatch):
+    # Offload alone (no custom timeout) must still bind the gloo co-backend.
+    monkeypatch.setattr(mesh_utils, "_default_pg_has_cpu_backend", lambda: True)
+
+    override = _nccl_backend_override(
+        (MeshAxisName.EP,),
+        device_type="cuda",
+        timeout_minutes=None,
+    )
+
+    backend, _ = override[MeshAxisName.EP]
+    assert backend == "cuda:nccl,cpu:gloo"
+
+
+def test_backend_override_none_when_no_timeout_and_no_offload(monkeypatch):
+    monkeypatch.setattr(mesh_utils, "_default_pg_has_cpu_backend", lambda: False)
+
+    assert _nccl_backend_override((MeshAxisName.PP,), device_type="cuda", timeout_minutes=None) is None
+
+
+def test_backend_override_skipped_for_cpu_mesh(monkeypatch):
+    # A non-CUDA mesh never gets an override, even under offload.
+    monkeypatch.setattr(mesh_utils, "_default_pg_has_cpu_backend", lambda: True)
+
+    assert _nccl_backend_override((MeshAxisName.PP,), device_type="cpu", timeout_minutes=30) is None
+
+
+def test_default_pg_has_cpu_backend_false_when_uninitialized(monkeypatch):
+    monkeypatch.setattr(mesh_utils.dist, "is_available", lambda: True)
+    monkeypatch.setattr(mesh_utils.dist, "is_initialized", lambda: False)
+
+    assert mesh_utils._default_pg_has_cpu_backend() is False
+
+
+def test_default_pg_has_cpu_backend_detects_gloo_co_backend(monkeypatch):
+    monkeypatch.setattr(mesh_utils.dist, "is_available", lambda: True)
+    monkeypatch.setattr(mesh_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(mesh_utils.dist, "get_backend_config", lambda: "cuda:nccl,cpu:gloo")
+
+    assert mesh_utils._default_pg_has_cpu_backend() is True
+
+
+def test_default_pg_has_cpu_backend_false_for_plain_nccl(monkeypatch):
+    monkeypatch.setattr(mesh_utils.dist, "is_available", lambda: True)
+    monkeypatch.setattr(mesh_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(mesh_utils.dist, "get_backend_config", lambda: "cuda:nccl")
+
+    assert mesh_utils._default_pg_has_cpu_backend() is False
 
 
 def test_fsdp2_forwards_nccl_timeout_to_moe_mesh(monkeypatch):
